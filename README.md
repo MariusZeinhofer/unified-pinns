@@ -2,9 +2,11 @@
 
 This repository contains numerical illustrations of the theoretical analysis carried out in https://arxiv.org/abs/2311.00529
 
-## Setup
+## Setup Conda Environment
 
-The following are required:
-- python ...
-- jax ...
-- etc
+You can set up the `conda` environment and activate it (cpu-jax only)
+
+```bash
+conda env create --file environment.yaml
+conda activate unified-pinns
+```
