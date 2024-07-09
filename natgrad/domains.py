@@ -210,3 +210,90 @@ class HypercubeParabolicBoundary:
 
     def distance_function(self, x):
         pass
+
+
+class HyperrectangleParabolicBoundary:
+    """
+    Boundary of a Hyperrectangle
+
+    """
+
+    def __init__(self, intervals):
+        self._intervals = jnp.array(intervals)
+        # add check
+        self._hyperrectangle = Hyperrectangle(intervals)
+
+    def measure(self):
+        return jnp.prod(self._intervals[:, 1] - self._intervals[:, 0])
+
+    def random_integration_points(self, key, N=50):
+        x = self._hyperrectangle.random_integration_points(key, N)
+        length = jnp.sum(self._intervals[:, 1] - self._intervals[:, 0])
+
+        for i in range(0, N):
+            # advance random key
+            key_0, key_1 = jax.random.split(key, num=2)
+            key = key_0
+
+            # location is float in [0, sum of interval lengths]
+            location = random.uniform(key_1, (), minval=0.0, maxval=length)
+            rand_dim = in_interval(location, self._intervals)
+
+            # 0 or 1 depending on side
+            index = jax.random.randint(key_0, shape=(), minval=0, maxval=2)
+            rand_side = self._intervals[rand_dim, index]
+
+            # project to random sides of the Hypercubes boundary
+            x = x.at[i, rand_dim].set(rand_side)
+
+        # take out points corresponding to final time
+        check_final = []
+        for i in range(len(x)):
+            if x[i, 0] == 1.0:
+                check_final.append(False)
+            else:
+                check_final.append(True)
+
+        return x[check_final, :]
+
+    def distance_function(self, x):
+        pass
+
+
+class HypercubeBoundary:
+    """
+    Boundary of the UNIT HyperCube
+
+    """
+
+    def __init__(self, dim):
+        if not isinstance(dim, int):
+            raise TypeError("[Constructor HypercubeBoundary:] dim " "must be integer")
+
+        self._dim = dim
+        self._hypercube = Hyperrectangle([(0.0, 1.0) for _ in range(0, self._dim)])
+
+    def measure(self):
+        return 2.0 * self._dim
+
+    def random_integration_points(self, key, N=50):
+        x = self._hypercube.random_integration_points(key, N)
+
+        for i in range(0, N):
+            # advance random key
+            key_0, key_1 = jax.random.split(key, num=2)
+            key = key_0
+
+            # 0 or 1 depending on side
+            rand_side = float(jax.random.randint(key_0, shape=(), minval=0, maxval=2))
+
+            # 0, ..., dim-1, determines which coordinate is set to 0 or 1
+            rand_dim = jax.random.randint(key_1, shape=(), minval=0, maxval=self._dim)
+
+            # project to random sides of the Hypercubes boundary
+            x = x.at[i, rand_dim].set(rand_side)
+
+        return x
+
+    def distance_function(self, x):
+        pass
