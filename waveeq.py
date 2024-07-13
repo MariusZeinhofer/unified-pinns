@@ -1,3 +1,12 @@
+"""
+Implementation of 3d wave equation.
+
+Manufactured solution is
+
+u(t,x,y,z) = sin(pi t)sin(pi x)sin(pi y)sin(pi z)
+
+"""
+
 import argparse
 import jax
 import jax.numpy as jnp
@@ -6,15 +15,16 @@ from jax import vmap, jit, grad, jacrev
 from jax.flatten_util import ravel_pytree
 from jax.numpy.linalg import lstsq
 
-
 from natgrad.domains import (
     Hyperrectangle,
+    HyperrectangleInitial,
     HyperrectangleParabolicBoundary,
 )
 import natgrad.mlp as mlp
-from natgrad.utility import grid_line_search_factory
-from natgrad.derivatives import del_i
+from natgrad.derivatives import laplace
 from natgrad.gram import gram_factory
+from natgrad.utility import grid_line_search_factory
+
 
 jax.config.update("jax_enable_x64", True)
 
@@ -43,17 +53,27 @@ parser.add_argument(
     default=200,
     type=int,
 )
+parser.add_argument(
+    "--N_init",
+    help="number of boundary collocation points",
+    default=100,
+    type=int,
+)
 args = parser.parse_args()
 
 ITER = args.iter
 LM = args.LM
 N_Omega = args.N_Omega
 N_Gamma = args.N_Gamma
+N_init = args.N_init
 
-print(f"HEAT with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}")
+print(
+    f"WAVE EQUATION with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}, "
+    f"N_init={N_init}"
+)
 
 # random seed for model weigths
-seed = 1
+seed = 0
 
 # model
 activation = lambda x: jnp.tanh(x)
@@ -64,60 +84,85 @@ f_params, unravel = ravel_pytree(params)
 
 # collocation points
 dim = 4
-interior = Hyperrectangle([(0.0, 1.0) for _ in range(0, dim)])
-boundary = HyperrectangleParabolicBoundary([(0.0, 1.0) for _ in range(0, dim)])
+intervals = [(0.0, 1.0) for _ in range(0, dim)]
+interior = Hyperrectangle(intervals)
+boundary = HyperrectangleParabolicBoundary(intervals)
+initial = HyperrectangleInitial(intervals)
 x_Omega = interior.random_integration_points(random.PRNGKey(0), N=N_Omega)
 x_eval = interior.random_integration_points(random.PRNGKey(999), N=10 * N_Omega)
 x_Gamma = boundary.random_integration_points(random.PRNGKey(0), N=N_Gamma)
+x_init = initial.random_integration_points(random.PRNGKey(0), N=N_init)
 
 
-# solution and right-hand side
 @jit
-def u_star(z):
-    t = z[0]
-    x_1 = z[1]
-    x_2 = z[2]
-    x_3 = z[3]
-    u_0 = jnp.cos(jnp.pi * x_1) + jnp.cos(jnp.pi * x_2) + jnp.cos(jnp.pi * x_3)
-    u = jnp.exp(-(jnp.pi**2) * t * 0.25) * u_0
+def u_star(txyz):
+    t = txyz[0]
+    x = txyz[1]
+    y = txyz[2]
+    z = txyz[3]
+    u = (
+        jnp.sin(jnp.pi * t)
+        * jnp.sin(jnp.pi * x)
+        * jnp.sin(jnp.pi * y)
+        * jnp.sin(jnp.pi * z)
+    )
     return jnp.reshape(u, (1,))
 
 
-def f(z):
-    return jnp.zeros((1,))
+v_u_star = vmap(u_star, (0))
 
 
-# residuals
-def interior_res(params, x):
-    dt_u = del_i(lambda x: model(params, x), argnum=0)
-    dxx_u = del_i(del_i(lambda x: model(params, x), argnum=1), argnum=1)
-    dyy_u = del_i(del_i(lambda x: model(params, x), argnum=2), argnum=2)
-    dzz_u = del_i(del_i(lambda x: model(params, x), argnum=3), argnum=3)
-    return dt_u(x) - 0.25 * (dxx_u(x) + dyy_u(x) + dzz_u(x)) - f(x)
+def f(txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    L = laplace(lambda xi: u_star(jnp.concatenate([t, xi])))(xyz)
+    dtt_u = laplace(lambda s: u_star(jnp.concatenate([s, xyz])))(t)
+    return dtt_u - L
+
+
+# stokes operator residual
+def interior_res(params, txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    dtt_u = laplace(lambda s: model(params, jnp.concatenate([s, xyz])))(t)
+    L = laplace(lambda xi: model(params, jnp.concatenate([t, xi])))(xyz)
+    return dtt_u - L - f(txyz)
 
 
 v_interior_res = vmap(interior_res, (None, 0))
 
-boundary_res = lambda params, x: model(params, x) - u_star(x)
+
+# boundary residual
+def boundary_res(params, txyz):
+    return model(params, txyz) - u_star(txyz)
+
+
 v_boundary_res = vmap(boundary_res, (None, 0))
 
 
+def initial_res(params, txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    dt_u = jacrev(lambda s: model(params, jnp.concatenate([s, xyz])))(t)
+    dt_u_star = jacrev(lambda s: u_star(jnp.concatenate([s, xyz])))(t)
+    return dt_u - dt_u_star
+
+
+v_initial_res = vmap(initial_res, (None, 0))
+
+
 # loss function
-def interior_loss(params):
-    return 1.0 / 2.0 * jnp.mean(v_interior_res(params, x_Omega) ** 2)
-
-
-def boundary_loss(params):
-    return 4 * 1.0 / 2.0 * jnp.mean(v_boundary_res(params, x_Gamma) ** 2)
-
-
-@jit
 def loss(params):
-    return interior_loss(params) + boundary_loss(params)
+    return (
+        0.5 * jnp.mean(v_interior_res(params, x_Omega) ** 2)
+        + 0.5 * jnp.mean(v_initial_res(params, x_init) ** 2)
+        + 7.0 * 0.5 * jnp.mean(v_boundary_res(params, x_Gamma) ** 2)
+    )
 
 
 # gramians
 gram_int = jit(gram_factory(interior_res))
+gram_init = jit(gram_factory(initial_res))
 gram_bdry = jit(gram_factory(boundary_res))
 
 # set up grid line search
@@ -159,8 +204,9 @@ for iteration in range(ITER):
 
     # assemble gramian
     G_int = gram_int(params, x=x_Omega)
-    G_bdry = 4.0 * gram_bdry(params, x=x_Gamma)
-    G = G_int + G_bdry
+    G_init = gram_init(params, x=x_init)
+    G_bdry = 7.0 * gram_bdry(params, x=x_Gamma)
+    G = G_int + G_bdry + G_init
 
     # Marquardt-Levenberg
     Id = jnp.identity(len(G))
@@ -185,4 +231,4 @@ for iteration in range(ITER):
 
 l2_error = l2_norm(v_error, x_eval)
 h1_error = l2_error + l2_norm(v_error_abs_grad, x_eval)
-print(f"HEAT EQUATION: loss: {loss(params)} L2: {l2_error} H1: {h1_error}")
+print(f"WAVE EQUATION: loss {loss(params)} L2 {l2_error} H1 {h1_error}")

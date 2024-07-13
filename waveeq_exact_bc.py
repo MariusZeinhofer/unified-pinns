@@ -15,7 +15,11 @@ from jax import vmap, jit, grad, jacrev
 from jax.flatten_util import ravel_pytree
 from jax.numpy.linalg import lstsq
 
-from natgrad.domains import Hyperrectangle, HypercubeInitial, HypercubeParabolicBoundary
+from natgrad.domains import (
+    Hyperrectangle,
+    HyperrectangleInitial,
+    HyperrectangleParabolicBoundary,
+)
 import natgrad.mlp as mlp
 from natgrad.derivatives import laplace
 from natgrad.gram import gram_factory
@@ -34,15 +38,39 @@ parser.add_argument(
 parser.add_argument(
     "--iter",
     help="number of iterations",
+    default=500,
+    type=int,
+)
+parser.add_argument(
+    "--N_Omega",
+    help="number of interior collocation points",
+    default=1500,
+    type=int,
+)
+parser.add_argument(
+    "--N_Gamma",
+    help="number of boundary collocation points",
     default=200,
+    type=int,
+)
+parser.add_argument(
+    "--N_init",
+    help="number of boundary collocation points",
+    default=100,
     type=int,
 )
 args = parser.parse_args()
 
 ITER = args.iter
 LM = args.LM
+N_Omega = args.N_Omega
+N_Gamma = args.N_Gamma
+N_init = args.N_init
 
-print(f"WAVE EQUATION with ITER={ITER}, LM={LM}")
+print(
+    f"WAVE EQUATION EXACT BC with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, "
+    f"N_Gamma={N_Gamma}, N_init={N_init}"
+)
 
 # random seed for model weigths
 seed = 0
@@ -51,18 +79,30 @@ seed = 0
 activation = lambda x: jnp.tanh(x)
 layer_sizes = [4, 64, 1]
 params = mlp.init_params(layer_sizes, random.PRNGKey(seed))
-model = mlp.mlp(activation)
+_model = mlp.mlp(activation)
 f_params, unravel = ravel_pytree(params)
+
+
+# model with exact bc and intial conditions
+def model(params, txyz):
+    t = txyz[0]
+    x = txyz[1]
+    y = txyz[2]
+    z = txyz[3]
+
+    return _model(params, txyz) * (x * (1 - x)) * (y * (1 - y)) * (z * (1 - z)) * t
+
 
 # collocation points
 dim = 4
-interior = Hyperrectangle([(0.0, 1.0) for _ in range(0, dim)])
-boundary = HypercubeParabolicBoundary(dim)
-initial = HypercubeInitial(dim)
-x_Omega = interior.random_integration_points(random.PRNGKey(0), N=1200)
-x_eval = interior.random_integration_points(random.PRNGKey(0), N=9000)
-x_Gamma = boundary.random_integration_points(random.PRNGKey(0), N=120)
-x_init = initial.random_integration_points(random.PRNGKey(0), N=90)
+intervals = [(0.0, 1.0) for _ in range(0, dim)]
+interior = Hyperrectangle(intervals)
+boundary = HyperrectangleParabolicBoundary(intervals)
+initial = HyperrectangleInitial(intervals)
+x_Omega = interior.random_integration_points(random.PRNGKey(0), N=N_Omega)
+x_eval = interior.random_integration_points(random.PRNGKey(999), N=10 * N_Omega)
+x_Gamma = boundary.random_integration_points(random.PRNGKey(0), N=N_Gamma)
+x_init = initial.random_integration_points(random.PRNGKey(0), N=N_init)
 
 
 @jit
@@ -190,7 +230,7 @@ for iteration in range(ITER):
     # one step of NGD
     params, actual_step = ls_update(params, nat_grad)
 
-    if iteration % 5 == 0:
+    if iteration % 50 == 0:
         # errors
         l2_error = l2_norm(v_error, x_eval)
         h1_error = l2_error + l2_norm(v_error_abs_grad, x_eval)

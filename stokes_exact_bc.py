@@ -58,16 +58,27 @@ LM = args.LM
 N_Omega = args.N_Omega
 N_Gamma = args.N_Gamma
 
-print(f"STOKES with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}")
+print(
+    f"STOKES EXACT BC with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}"
+)
 
 # random seed for model weigths
 seed = 0
 
-# model
+# model with exact bc
 activation_u = lambda x: jnp.tanh(x)
 layer_sizes_u = [3, 32, 3]
 params_u = mlp.init_params(layer_sizes_u, random.PRNGKey(seed))
-model_u = mlp.mlp(activation_u)
+_model_u = mlp.mlp(activation_u)
+model_u = (
+    lambda params, x: _model_u(params, x)
+    * x[0]
+    * (1 - x[0])
+    * x[1]
+    * (1 - x[1])
+    * x[2]
+    * (1 - x[2])
+)
 f_params_u, unravel_u = ravel_pytree(params_u)
 
 # model
@@ -273,6 +284,6 @@ h1_error_u = l2_error_u + l2_norm(v_error_u_abs_grad, x_eval)
 h1_semi_p = l2_norm(v_error_p_abs_grad, x_eval)
 
 print(
-    f"STOKES: loss {loss(params_u, params_p)} L2 u {l2_error_u} H1 u {h1_error_u} "
-    f"H1 semi p {h1_semi_p}."
+    f"STOKES EXACT BC: loss {loss(params_u, params_p)} L2 u {l2_error_u} "
+    f" H1 u {h1_error_u} H1 semi p {h1_semi_p}."
 )

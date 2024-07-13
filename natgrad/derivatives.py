@@ -64,3 +64,12 @@ def div(func, argnum=0):
         return jnp.trace(J, axis1=-2, axis2=-1)
 
     return div_f
+
+
+# should be applied to functions (d,) -> (d,)
+def symgrad(func, argnum=0):
+    def eps_u(*args, **kwargs):
+        Du = jacrev(func, argnum)(*args, **kwargs)
+        return 0.5 * (Du + jnp.transpose(Du))
+
+    return eps_u

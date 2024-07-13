@@ -1,8 +1,11 @@
 """
 Implementation of 3d stokes problem.
 
-Manufactured 3d solution from the paper:
+Manufactured 3d solution from paper:
 https://arxiv.org/pdf/2208.13540.pdf
+
+to add time dependence we multiply the solution
+by exp(-0.5t) and adapt the rhs etc accordingly.
 
 """
 
@@ -10,11 +13,11 @@ import argparse
 import jax
 import jax.numpy as jnp
 from jax import random
-from jax import vmap, jit, grad, jacrev
+from jax import vmap, jit, grad, jacrev, jacfwd
 from jax.flatten_util import ravel_pytree
 from jax.numpy.linalg import lstsq
 
-from natgrad.domains import Hyperrectangle, HyperrectangleBoundary
+from natgrad.domains import Hyperrectangle, HyperrectangleParabolicBoundary
 import natgrad.mlp as mlp
 from natgrad.utility import (
     two_variable_grid_line_search_factory as grid_line_search_factory,
@@ -22,7 +25,6 @@ from natgrad.utility import (
 from natgrad.utility import flatten_pytrees
 from natgrad.derivatives import laplace, div
 from natgrad.gram import gram_factory
-
 
 jax.config.update("jax_enable_x64", True)
 
@@ -58,106 +60,111 @@ LM = args.LM
 N_Omega = args.N_Omega
 N_Gamma = args.N_Gamma
 
-print(f"STOKES with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}")
+print(
+    f"TRANSIENT STOKES with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}"
+)
 
 # random seed for model weigths
 seed = 0
 
 # model
 activation_u = lambda x: jnp.tanh(x)
-layer_sizes_u = [3, 32, 3]
+layer_sizes_u = [4, 32, 3]
 params_u = mlp.init_params(layer_sizes_u, random.PRNGKey(seed))
 model_u = mlp.mlp(activation_u)
 f_params_u, unravel_u = ravel_pytree(params_u)
 
 # model
 activation_p = lambda x: jnp.tanh(x)
-layer_sizes_p = [3, 32, 1]
+layer_sizes_p = [4, 32, 1]
 params_p = mlp.init_params(layer_sizes_p, random.PRNGKey(seed))
 model_p = mlp.mlp(activation_p)
 f_params_p, unravel_p = ravel_pytree(params_u)
 
 # collocation points
-dim = 3
+dim = 4
 intervals = [(0.0, 1.0) for _ in range(0, dim)]
 interior = Hyperrectangle(intervals)
-boundary = HyperrectangleBoundary(intervals)
+boundary = HyperrectangleParabolicBoundary(intervals)
 x_Omega = interior.random_integration_points(random.PRNGKey(0), N=N_Omega)
 x_eval = interior.random_integration_points(random.PRNGKey(999), N=10 * N_Omega)
 x_Gamma = boundary.random_integration_points(random.PRNGKey(0), N=N_Gamma)
 
 
-# solution and right-hand side
-# (2,) -> (2,)
 @jit
-def u_star0(xyz):
-    x = xyz[0]
-    y = xyz[1]
-    z = xyz[2]
-    u_1 = 0.0
-    u_2 = ((1 - x) ** 2 * x**2 * (1 - y) ** 2 * y**2) * (4 * z**3 - 6 * z**2 + 2 * z)
-    u_3 = ((1 - x) ** 2 * x**2 * (1 - z) ** 2 * z**2) * (4 * y**3 - 6 * y**2 + 2 * y)
-    return jnp.array([u_1, u_2, u_3])
+def u_star_bcurl(txyz):
+    t = txyz[0]
+    x = txyz[1]
+    y = txyz[2]
+    z = txyz[3]
+    e = jnp.exp(-0.5 * t)
 
-
-v_u_star0 = vmap(u_star0, (0))
-
-
-@jit
-def u_star_bcurl(xyz):
-    x = xyz[0]
-    y = xyz[1]
-    z = xyz[2]
-    u_1 = (1 - x) * x * (1 - y) ** 2 * y**2 * (1 - z) ** 2 * z**2
-    u_2 = 0.0
-    u_3 = 0.0
+    u_1 = e * (1 - x) * x * (1 - y) ** 2 * y**2 * (1 - z) ** 2 * z**2
+    u_2 = 0.0  # ((1-x)**2 * x**2 * (1-y)**2 * y**2) * (4*z**3 - 6*z**2 + 2*z)
+    u_3 = 0.0  # ((1-x)**2 * x**2 * (1-z)**2 * z**2) * (4*y**3 - 6*y**2 + 2*y)
     return jnp.array([u_1, u_2, u_3])
 
 
 @jit
-def u_star(x):
-    J = jacrev(u_star_bcurl)(x)
+def u_star(txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    J = jacrev(lambda xi: u_star_bcurl(jnp.concatenate([t, xi])))(xyz)
     return jnp.array([J[2, 1] - J[1, 2], J[0, 2] - J[2, 0], J[1, 0] - J[0, 1]])
 
 
 v_u_star = vmap(u_star, 0)
 
+
 # assert that diveregnece of the true solution is zero
-div_ustar = vmap(lambda x: jnp.trace(jacrev(u_star)(x)))
-assert jnp.max(jnp.abs(div_ustar(x_eval))) < 1e-16
+def div_ustar(txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    J = jacrev(lambda xi: u_star(jnp.concatenate([t, xi])))(xyz)
+    return jnp.trace(J)
+
+
+v_div_ustar = vmap(div_ustar, 0)
+assert jnp.max(jnp.abs(v_div_ustar(x_eval))) < 1e-16
 
 
 @jit
-def p_star(xyz):
-    x = xyz[0]
-    y = xyz[1]
-    z = xyz[2]
-    return x * y * z * (1 - x) * (1 - y) * (1 - z)
+def p_star(txyz):
+    t = txyz[0]
+    x = txyz[1]
+    y = txyz[2]
+    z = txyz[3]
+    e = jnp.exp(-0.5 * t)
+    return e * x * y * z * (1 - x) * (1 - y) * (1 - z)
 
 
-@jit
-def f(x):
-    return jnp.array([0.0, 0.0])
-
-
-f = lambda x: -laplace(u_star)(x) + jacrev(p_star)(x)
+def f(txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    L = -laplace(lambda xi: u_star(jnp.concatenate([t, xi])))(xyz)
+    P = jacrev(lambda xi: p_star(jnp.concatenate([t, xi])))(xyz)
+    return L + P
 
 
 # stokes operator residual
-def interior_res(params_u, params_p, x):
-    return (
-        laplace(model_u, argnum=1)(params_u, x)
-        + f(x)
-        - jacrev(model_p, argnums=1)(params_p, x)
-    )
+def interior_res(params_u, params_p, txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    dt_u = jacfwd(lambda s: model_u(params_u, jnp.concatenate([s, xyz])))(t)
+    L = laplace(lambda xi: model_u(params_u, jnp.concatenate([t, xi])))(xyz)
+    P = jacrev(lambda xi: model_p(params_p, jnp.concatenate([t, xi])))(xyz)
+    return dt_u - L - f(txyz) + P
 
 
 v_interior_res = vmap(interior_res, (None, None, 0))
 
 
 # divergence residual
-def div_res(params_u, x):
-    return div(model_u, argnum=1)(params_u, x)
+def div_res(params_u, txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    DIV = div(lambda xi: model_u(params_u, jnp.concatenate([t, xi])))(xyz)
+    return DIV
 
 
 v_div_res = vmap(div_res, (None, 0))
@@ -221,7 +228,17 @@ v_error_u_abs_grad = vmap(lambda x: jnp.sum(jacrev(error_u)(x) ** 2.0) ** 0.5)
 
 error_p = lambda x: model_p(params_p, x) - p_star(x)
 v_error_p = vmap(error_p, (0))
-v_error_p_abs_grad = vmap(lambda x: jnp.sum(jacrev(error_p)(x) ** 2.0) ** 0.5)
+
+
+def spatial_derivative_error_p(txyz):
+    t = txyz[0:1]
+    xyz = txyz[1:]
+    return jacrev(lambda xi: error_p(jnp.concatenate([t, xi])))(xyz)
+
+
+v_error_p_abs_grad = vmap(
+    lambda x: jnp.sum(spatial_derivative_error_p(x) ** 2.0) ** 0.5
+)
 
 
 def l2_norm(f, x_eval):
@@ -258,12 +275,14 @@ for iteration in range(ITER):
     if iteration % 50 == 0:
         l2_error_u = l2_norm(v_error_u, x_eval)
         h1_error_u = l2_error_u + l2_norm(v_error_u_abs_grad, x_eval)
+        l2_error_p = l2_norm(v_error_p, x_eval)
         h1_semi_p = l2_norm(v_error_p_abs_grad, x_eval)
 
         print(
             f"NG Iteration: {iteration} with loss: "
             f"{loss(params_u, params_p)} with error "
             f"L2: {l2_error_u} and error H1: {h1_error_u} and "
+            f"L2 p {l2_error_p} "
             f"H1 semi p {h1_semi_p} "
             f"step: {actual_step}"
         )
@@ -271,8 +290,7 @@ for iteration in range(ITER):
 l2_error_u = l2_norm(v_error_u, x_eval)
 h1_error_u = l2_error_u + l2_norm(v_error_u_abs_grad, x_eval)
 h1_semi_p = l2_norm(v_error_p_abs_grad, x_eval)
-
 print(
-    f"STOKES: loss {loss(params_u, params_p)} L2 u {l2_error_u} H1 u {h1_error_u} "
-    f"H1 semi p {h1_semi_p}."
+    f"STOKES: loss {loss(params_u, params_p)} "
+    f"L2 u {l2_error_u} H1 u {h1_error_u} H1 semi p {h1_semi_p}"
 )

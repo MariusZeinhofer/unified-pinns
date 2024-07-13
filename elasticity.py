@@ -1,19 +1,23 @@
-import argparse
+"""
+Implementation of 3d elasticity problem.
+Manufactured solution from this FEM paper:
+
+https://www.sciencedirect.com/science/article/pii/S0377042709002349?ref=pdf_download&fr=RR-2&rr=80bdfdaa2d780b51
+
+"""
+
 import jax
 import jax.numpy as jnp
 from jax import random
 from jax import vmap, jit, grad, jacrev
 from jax.flatten_util import ravel_pytree
 from jax.numpy.linalg import lstsq
+import argparse
 
-
-from natgrad.domains import (
-    Hyperrectangle,
-    HyperrectangleParabolicBoundary,
-)
+from natgrad.domains import Hyperrectangle, HyperrectangleBoundary
 import natgrad.mlp as mlp
 from natgrad.utility import grid_line_search_factory
-from natgrad.derivatives import del_i
+from natgrad.derivatives import symgrad, div
 from natgrad.gram import gram_factory
 
 jax.config.update("jax_enable_x64", True)
@@ -50,52 +54,68 @@ LM = args.LM
 N_Omega = args.N_Omega
 N_Gamma = args.N_Gamma
 
-print(f"HEAT with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}")
+print(f"ELASTICITY with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}")
 
 # random seed for model weigths
-seed = 1
+seed = 0
 
 # model
 activation = lambda x: jnp.tanh(x)
-layer_sizes = [4, 64, 1]
+layer_sizes = [3, 48, 3]
 params = mlp.init_params(layer_sizes, random.PRNGKey(seed))
 model = mlp.mlp(activation)
 f_params, unravel = ravel_pytree(params)
 
 # collocation points
-dim = 4
-interior = Hyperrectangle([(0.0, 1.0) for _ in range(0, dim)])
-boundary = HyperrectangleParabolicBoundary([(0.0, 1.0) for _ in range(0, dim)])
+dim = 3
+intervals = [(0.0, 1.0) for _ in range(0, dim)]
+interior = Hyperrectangle(intervals)
+boundary = HyperrectangleBoundary(intervals)
 x_Omega = interior.random_integration_points(random.PRNGKey(0), N=N_Omega)
 x_eval = interior.random_integration_points(random.PRNGKey(999), N=10 * N_Omega)
 x_Gamma = boundary.random_integration_points(random.PRNGKey(0), N=N_Gamma)
 
 
 # solution and right-hand side
-@jit
-def u_star(z):
-    t = z[0]
-    x_1 = z[1]
-    x_2 = z[2]
-    x_3 = z[3]
-    u_0 = jnp.cos(jnp.pi * x_1) + jnp.cos(jnp.pi * x_2) + jnp.cos(jnp.pi * x_3)
-    u = jnp.exp(-(jnp.pi**2) * t * 0.25) * u_0
-    return jnp.reshape(u, (1,))
+def u_star(x):
+    x_1 = x[0]
+    x_2 = x[1]
+    x_3 = x[2]
+    val = (x_1**2 + 1) * (x_2**2 + 1) * (x_3**2 + 1) * jnp.exp(x_1 + x_2 + x_3)
+    return jnp.array([val, val, val])
 
 
-def f(z):
-    return jnp.zeros((1,))
+v_u_star = vmap(u_star, (0))
+
+
+def C_factory(lam, mu):
+    def C(eps):
+        return lam * jnp.trace(eps) * jnp.identity(len(eps)) + 2.0 * mu * eps
+
+    return C
+
+
+C = C_factory(lam=0.5769, mu=0.3846)
+
+# locking regime, nu=0.49
+# C = C_factory(lam=0.3356, mu=16.4430)
 
 
 # residuals
-def interior_res(params, x):
-    dt_u = del_i(lambda x: model(params, x), argnum=0)
-    dxx_u = del_i(del_i(lambda x: model(params, x), argnum=1), argnum=1)
-    dyy_u = del_i(del_i(lambda x: model(params, x), argnum=2), argnum=2)
-    dzz_u = del_i(del_i(lambda x: model(params, x), argnum=3), argnum=3)
-    return dt_u(x) - 0.25 * (dxx_u(x) + dyy_u(x) + dzz_u(x)) - f(x)
+def div_symgrad(u, argnum=0):
+    eps = symgrad(u, argnum)
+
+    def C_eps(*args, **kwargs):
+        return C(eps(*args, **kwargs))
+
+    return div(C_eps, argnum)
 
 
+def f(x):
+    return -div_symgrad(u_star, argnum=0)(x)
+
+
+interior_res = lambda params, x: div_symgrad(model, argnum=1)(params, x) + f(x)
 v_interior_res = vmap(interior_res, (None, 0))
 
 boundary_res = lambda params, x: model(params, x) - u_star(x)
@@ -108,7 +128,7 @@ def interior_loss(params):
 
 
 def boundary_loss(params):
-    return 4 * 1.0 / 2.0 * jnp.mean(v_boundary_res(params, x_Gamma) ** 2)
+    return 6.0 * 1.0 / 2.0 * jnp.mean(v_boundary_res(params, x_Gamma) ** 2)
 
 
 @jit
@@ -126,17 +146,12 @@ steps = 0.5**grid
 ls_update = grid_line_search_factory(loss, steps)
 
 # errors
-error = lambda x: jnp.reshape(model(params, x) - u_star(x), ())
+error = lambda x: model(params, x) - u_star(x)
 v_error = vmap(error, (0))
+v_error_abs_grad = vmap(lambda x: jnp.sum(jacrev(error)(x) ** 2.0) ** 0.5)
+v_u_star_abs_grad = vmap(lambda x: jnp.sum(jacrev(u_star)(x) ** 2.0) ** 0.5)
 
-
-def spatial_derivative_error(txyz):
-    t = txyz[0:1]
-    xyz = txyz[1:]
-    return jacrev(lambda xi: error(jnp.concatenate([t, xi])))(xyz)
-
-
-v_error_abs_grad = vmap(lambda x: jnp.sum(spatial_derivative_error(x) ** 2.0) ** 0.5)
+error_divv = vmap(lambda x: jnp.trace(jacrev(v_error)(x) ** 2) ** 0.5)
 
 
 def l2_norm(f, x_eval):
@@ -144,7 +159,9 @@ def l2_norm(f, x_eval):
 
 
 l2_error = l2_norm(v_error, x_eval)
+u_l2_norm = l2_norm(v_u_star, x_eval)
 h1_error = l2_error + l2_norm(v_error_abs_grad, x_eval)
+u_h1_norm = u_l2_norm + l2_norm(v_u_star_abs_grad, x_eval)
 
 print(
     f"Before training: loss: {loss(params)} with error "
@@ -159,10 +176,10 @@ for iteration in range(ITER):
 
     # assemble gramian
     G_int = gram_int(params, x=x_Omega)
-    G_bdry = 4.0 * gram_bdry(params, x=x_Gamma)
+    G_bdry = 6.0 * gram_bdry(params, x=x_Gamma)
     G = G_int + G_bdry
 
-    # Marquardt-Levenberg
+    # Marquardt-Levenberg, LM can also be zero
     Id = jnp.identity(len(G))
     G = jnp.min(jnp.array([loss(params), LM])) * Id + G
 
@@ -185,4 +202,4 @@ for iteration in range(ITER):
 
 l2_error = l2_norm(v_error, x_eval)
 h1_error = l2_error + l2_norm(v_error_abs_grad, x_eval)
-print(f"HEAT EQUATION: loss: {loss(params)} L2: {l2_error} H1: {h1_error}")
+print(f"ELASTICITY: loss: {loss(params)} L2: {l2_error} H1: {h1_error}")

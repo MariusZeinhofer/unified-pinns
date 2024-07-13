@@ -1,19 +1,20 @@
+"""
+Implementation of examplary residual.
+
+"""
+
 import argparse
 import jax
 import jax.numpy as jnp
 from jax import random
-from jax import vmap, jit, grad, jacrev
+from jax import vmap, jit, grad, jacrev, hessian
 from jax.flatten_util import ravel_pytree
 from jax.numpy.linalg import lstsq
 
-
-from natgrad.domains import (
-    Hyperrectangle,
-    HyperrectangleParabolicBoundary,
-)
+from natgrad.domains import Hyperrectangle, HyperrectangleBoundary
 import natgrad.mlp as mlp
 from natgrad.utility import grid_line_search_factory
-from natgrad.derivatives import del_i
+from natgrad.derivatives import laplace
 from natgrad.gram import gram_factory
 
 jax.config.update("jax_enable_x64", True)
@@ -50,52 +51,50 @@ LM = args.LM
 N_Omega = args.N_Omega
 N_Gamma = args.N_Gamma
 
-print(f"HEAT with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}")
+print(
+    f"POISSON EXACT BC with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}"
+)
 
 # random seed for model weigths
-seed = 1
+seed = 0
 
 # model
 activation = lambda x: jnp.tanh(x)
-layer_sizes = [4, 64, 1]
+layer_sizes = [3, 64, 1]
 params = mlp.init_params(layer_sizes, random.PRNGKey(seed))
-model = mlp.mlp(activation)
+_model = mlp.mlp(activation)
 f_params, unravel = ravel_pytree(params)
+model = (
+    lambda params, x: _model(params, x)
+    * x[0]
+    * (1 - x[0])
+    * x[1]
+    * (1 - x[1])
+    * x[2]
+    * (1 - x[2])
+)
 
 # collocation points
-dim = 4
-interior = Hyperrectangle([(0.0, 1.0) for _ in range(0, dim)])
-boundary = HyperrectangleParabolicBoundary([(0.0, 1.0) for _ in range(0, dim)])
+dim = 3
+intervals = [(0.0, 1.0) for _ in range(0, dim)]
+interior = Hyperrectangle(intervals)
+boundary = HyperrectangleBoundary(intervals)
 x_Omega = interior.random_integration_points(random.PRNGKey(0), N=N_Omega)
 x_eval = interior.random_integration_points(random.PRNGKey(999), N=10 * N_Omega)
 x_Gamma = boundary.random_integration_points(random.PRNGKey(0), N=N_Gamma)
 
 
 # solution and right-hand side
-@jit
-def u_star(z):
-    t = z[0]
-    x_1 = z[1]
-    x_2 = z[2]
-    x_3 = z[3]
-    u_0 = jnp.cos(jnp.pi * x_1) + jnp.cos(jnp.pi * x_2) + jnp.cos(jnp.pi * x_3)
-    u = jnp.exp(-(jnp.pi**2) * t * 0.25) * u_0
-    return jnp.reshape(u, (1,))
+def u_star(x):
+    return jnp.prod(jnp.sin(jnp.pi * x), keepdims=True)
 
 
-def f(z):
-    return jnp.zeros((1,))
+def f(x):
+    return 3.0 * jnp.pi**2 * u_star(x)
 
 
 # residuals
-def interior_res(params, x):
-    dt_u = del_i(lambda x: model(params, x), argnum=0)
-    dxx_u = del_i(del_i(lambda x: model(params, x), argnum=1), argnum=1)
-    dyy_u = del_i(del_i(lambda x: model(params, x), argnum=2), argnum=2)
-    dzz_u = del_i(del_i(lambda x: model(params, x), argnum=3), argnum=3)
-    return dt_u(x) - 0.25 * (dxx_u(x) + dyy_u(x) + dzz_u(x)) - f(x)
-
-
+interior_res = lambda params, x: laplace(model, argnum=1)(params, x) + f(x)
 v_interior_res = vmap(interior_res, (None, 0))
 
 boundary_res = lambda params, x: model(params, x) - u_star(x)
@@ -108,7 +107,7 @@ def interior_loss(params):
 
 
 def boundary_loss(params):
-    return 4 * 1.0 / 2.0 * jnp.mean(v_boundary_res(params, x_Gamma) ** 2)
+    return 6 * 1.0 / 2.0 * jnp.mean(v_boundary_res(params, x_Gamma) ** 2)
 
 
 @jit
@@ -128,15 +127,8 @@ ls_update = grid_line_search_factory(loss, steps)
 # errors
 error = lambda x: jnp.reshape(model(params, x) - u_star(x), ())
 v_error = vmap(error, (0))
-
-
-def spatial_derivative_error(txyz):
-    t = txyz[0:1]
-    xyz = txyz[1:]
-    return jacrev(lambda xi: error(jnp.concatenate([t, xi])))(xyz)
-
-
-v_error_abs_grad = vmap(lambda x: jnp.sum(spatial_derivative_error(x) ** 2.0) ** 0.5)
+v_error_abs_grad = vmap(lambda x: jnp.sum(jacrev(error)(x) ** 2.0) ** 0.5)
+v_error_abs_H2 = vmap(lambda x: jnp.sum(hessian(error)(x) ** 2) ** 0.5)
 
 
 def l2_norm(f, x_eval):
@@ -145,7 +137,7 @@ def l2_norm(f, x_eval):
 
 l2_error = l2_norm(v_error, x_eval)
 h1_error = l2_error + l2_norm(v_error_abs_grad, x_eval)
-
+h2_error = h1_error + l2_norm(v_error_abs_H2, x_eval)
 print(
     f"Before training: loss: {loss(params)} with error "
     f"L2: {l2_error} and error H1: {h1_error}."
@@ -159,7 +151,7 @@ for iteration in range(ITER):
 
     # assemble gramian
     G_int = gram_int(params, x=x_Omega)
-    G_bdry = 4.0 * gram_bdry(params, x=x_Gamma)
+    G_bdry = 6.0 * gram_bdry(params, x=x_Gamma)
     G = G_int + G_bdry
 
     # Marquardt-Levenberg
@@ -177,12 +169,17 @@ for iteration in range(ITER):
         # errors
         l2_error = l2_norm(v_error, x_eval)
         h1_error = l2_error + l2_norm(v_error_abs_grad, x_eval)
+        h2_error = h1_error + l2_norm(v_error_abs_H2, x_eval)
 
         print(
             f"NG Iteration: {iteration} with loss: {loss(params)} with error "
-            f"L2: {l2_error} and error H1: {h1_error} and step: {actual_step}"
+            f"L2: {l2_error} and error H1: {h1_error} and error H2: {h2_error} and step: {actual_step}"
         )
 
 l2_error = l2_norm(v_error, x_eval)
 h1_error = l2_error + l2_norm(v_error_abs_grad, x_eval)
-print(f"HEAT EQUATION: loss: {loss(params)} L2: {l2_error} H1: {h1_error}")
+h2_error = h1_error + l2_norm(v_error_abs_H2, x_eval)
+
+print(
+    f"POISSON EQUATION EXACT BC: loss {loss(params)}, L2 {l2_error}, H1 {h1_error}, H2 {h2_error}"
+)
