@@ -3,7 +3,7 @@
 import subprocess
 
 LM = 1e-5
-N_Omega, N_Gamma, N_init, N_data = 1700, 400, 500, 40
+N_Omega, N_Gamma, N_init, N_data = 3000, 800, 500, 40
 ITERATIONS = 5000
 
 
