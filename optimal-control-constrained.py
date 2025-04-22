@@ -147,7 +147,6 @@ def projection_prime(x, lower=-0.5, upper=0.7):
 
 # PDE data and manufactured solutions
 alpha = 0.01
-alpha = 0.00001
 y_star = lambda x: cart2pol(x)[0] ** 2
 
 def p_star(x):
