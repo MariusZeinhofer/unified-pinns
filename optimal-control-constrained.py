@@ -210,7 +210,8 @@ def assemble_H_bar(p_params, X):
         fct_p = lambda p_params, x: p_model(p_params, x).squeeze()
         return ravel_pytree(jax.grad(fct_p)(p_params, x))[0]
     
-    P = projection_prime(-1. / alpha * jax.vmap(p_model, (None, 0))(p_params, X))
+    #P = projection_prime(-1. / alpha * jax.vmap(p_model, (None, 0))(p_params, X))
+    P = -1. / alpha * projection_prime(-1. / alpha * jax.vmap(p_model, (None, 0))(p_params, X))
 
     return P * jax.vmap(f_fct_p, (None, 0))(p_params, X)
 
@@ -240,7 +241,7 @@ def l2_error_y(y_params, X):
 def l2_error_p(p_params, X):
     return jnp.mean(jax.vmap(lambda x: (p_model(p_params, x) - p_star(x)) ** 2)(X)) ** 0.5
 
-lr = 1e-4
+lr = 1e-2
 
 for iteration in range(100000):
 
@@ -273,7 +274,6 @@ for iteration in range(100000):
         nat_grads = unravel(f_nat_grad)
 
         # param update
-        lr = 1e-4
         params = jax.tree.map(lambda K, dK: K - lr * dK, params, nat_grads)
         y_params, p_params = params
 
