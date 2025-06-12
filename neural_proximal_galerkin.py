@@ -65,7 +65,7 @@ print(
 
 # Initialize training components
 key = jax.random.PRNGKey(seed)
-sampler_key, eval_key, u_key, psi_key, key = jax.random.split(key, num=5)
+sampler_key, eval_key, u_key, psi_key, psi_prev_key, key = jax.random.split(key, num=6)
 
 # distance function to boundary
 dist_fct = lambda x: x[0] * (1 - x[0]) * x[1] * (1 - x[1])
@@ -85,6 +85,7 @@ f_u_params, u_unravel = ravel_pytree(u_params)
 psi_activation = lambda x: jnp.tanh(x)
 psi_layer_sizes = [2, 16, 1]
 psi_params = mlp.init_params(psi_layer_sizes, psi_key)
+psi_prev_params = mlp.init_params(psi_layer_sizes, psi_prev_key)
 _psi_model = mlp.mlp(psi_activation)
 psi_model = lambda params, x : _psi_model(params, x) * dist_fct(x)
 f_psi_params, psi_unravel = ravel_pytree(psi_params)
@@ -101,19 +102,20 @@ x_Omega = interior.random_integration_points(sampler_key, N=N_Omega)
 x_eval = interior.random_integration_points(eval_key, N=10 * N_Omega)
 
 # PDE data and manufactured solutions
-alpha = 100.0
+alpha = 150.0
 u_star = lambda x: jnp.where((x[0] > 0), x[0] ** 4, 0.0)
 psi_star = lambda x: jnp.log(u_star(x) + 1e-10)
 f = lambda x: jnp.where((x[0] > 0), -12 * x[0] ** 2, 0)
 psi_prev = lambda x: 0
 
 # define ingredients for loss functions
-def residual_u(u_params, psi_params, x):
+def residual_u(u_params, psi_params, psi_prev_params, x):
     lap_u = laplace(u_model, argnum=1)(u_params, x)
     psi = psi_model(psi_params, x)
-    return alpha * lap_u - psi + psi_prev(x) + alpha * f(x)
+    psi_prev = psi_model(psi_prev_params, x)
+    return alpha * lap_u - psi + psi_prev + alpha * f(x)
 
-v_residual_u = jax.vmap(residual_u, (None, None, 0))
+v_residual_u = jax.vmap(residual_u, (None, None, None, 0))
 
 def residual_psi(u_params, psi_params, x):
     return u_model(u_params, x) - jnp.exp(psi_model(psi_params, x))
@@ -121,8 +123,8 @@ def residual_psi(u_params, psi_params, x):
 v_residual_psi = jax.vmap(residual_psi, (None, None, 0))
 
 @jax.jit
-def loss_fct(u_params, psi_params, X):
-    loss_u = 0.5 * jnp.mean(v_residual_u(u_params, psi_params, X) ** 2)
+def loss_fct(u_params, psi_params, psi_prev_params, X):
+    loss_u = 0.5 * jnp.mean(v_residual_u(u_params, psi_params, psi_prev_params, X) ** 2)
     loss_psi = 0.5 * jnp.mean(v_residual_psi(u_params, psi_params, X) ** 2)
     return loss_u + loss_psi
 
@@ -186,44 +188,48 @@ def l2_error_psi(psi_params, X):
 
 lr = 1e-1
 
-for iteration in range(100_000):
+for outer_iter in range(0, 1000):
+    print(f"Proximal iteration count: {outer_iter}")
+    for iteration in range(1001):
 
-    if method == "GD":
-        # autodiff magic
-        loss, grads = jax.value_and_grad(loss_fct, argnums=(0, 1))(u_params, psi_params, x_Omega)
+        if method == "GD":
+            # autodiff magic
+            loss, grads = jax.value_and_grad(loss_fct, argnums=(0, 1))(u_params, psi_params, psi_prev_params, x_Omega)
 
-        # param update
-        params = jax.tree.map(lambda K, dK: K - lr * dK, params, grads)
+            # param update
+            params = jax.tree.map(lambda K, dK: K - lr * dK, params, grads)
 
-        u_params, psi_params = params
+            u_params, psi_params = params
 
-        if iteration % 100 == 0:
-            print(
-                f"Iter {iteration}, loss {loss}, y_error {l2_error_u(u_params, x_eval)}, "
-                f"p_error {l2_error_psi(psi_params, x_eval)}"
-            )
+            if iteration % 100 == 0:
+                print(
+                    f"Iter {iteration}, loss {loss}, y_error {l2_error_u(u_params, x_eval)}, "
+                    f"p_error {l2_error_psi(psi_params, x_eval)}"
+                )
 
-    if method == "GN":
-        # autodiff magic
-        loss, grads = jax.value_and_grad(loss_fct, argnums=(0, 1))(u_params, psi_params, x_Omega)
-        f_grads = ravel_pytree(grads)[0]
+        if method == "GN":
+            # autodiff magic
+            loss, grads = jax.value_and_grad(loss_fct, argnums=(0, 1))(u_params, psi_params, psi_prev_params, x_Omega)
+            f_grads = ravel_pytree(grads)[0]
 
-        # build and regularize the Gramian
-        G = assemble_gramian(u_params, psi_params, x_Omega)
-        G += 1e-5 * jnp.identity(len(G))
+            # build and regularize the Gramian
+            G = assemble_gramian(u_params, psi_params, x_Omega)
+            G += 1e-5 * jnp.identity(len(G))
 
-        # compute natural gradient
-        f_nat_grad = lstsq(G, f_grads, rcond=-1)[0]
-        nat_grads = unravel(f_nat_grad)
+            # compute natural gradient
+            f_nat_grad = lstsq(G, f_grads, rcond=-1)[0]
+            nat_grads = unravel(f_nat_grad)
 
-        # param update
-        lr = 5 * 1e-3
-        params = jax.tree.map(lambda K, dK: K - lr * dK, params, nat_grads)
-        u_params, psi_params = params
+            # param update
+            lr = 5 * 1e-3
+            params = jax.tree.map(lambda K, dK: K - lr * dK, params, nat_grads)
+            u_params, psi_params = params
 
-        
-        if iteration % 100 == 0:
-            print(
-                f"Iter {iteration}, loss {loss}, u_error {l2_error_u(u_params, x_eval)}, "
-                f"psi_error {l2_error_psi(psi_params, x_eval)}"
-            )
+            
+            if iteration % 100 == 0:
+                print(
+                    f"Iter {iteration}, loss {loss}, u_error {l2_error_u(u_params, x_eval)}, "
+                    f"psi_error {l2_error_psi(psi_params, x_eval)}"
+                )
+    # update outer params
+    _, psi_prev_params = params
