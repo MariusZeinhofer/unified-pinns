@@ -196,7 +196,7 @@ def in_interval(xi: float, intervals) -> int:
             return i
 
     return ValueError(
-        "[in_interval] Invalid value to determine " "which boundary to project to."
+        "[in_interval] Invalid value to determine which boundary to project to."
     )
 
 
