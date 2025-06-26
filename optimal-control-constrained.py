@@ -204,7 +204,7 @@ def loss_fct(y_params, p_params, X):
 
 # Gauss-Newton matrix builders
 @jax.jit
-def assemble_J(y_params, X):
+def assemble_J_y(y_params, X):
     def f_grad_lap_y(y_params, x):
         lap_y = lambda y_params, x: laplace(y_model, argnum=1)(y_params, x).squeeze()
         return ravel_pytree(jax.grad(lap_y)(y_params, x))[0]
@@ -213,7 +213,7 @@ def assemble_J(y_params, X):
 
 
 @jax.jit
-def assemble_H(y_params, X):
+def assemble_M_y(y_params, X):
     def f_fct_y(y_params, x):
         fct_y = lambda y_params, x: y_model(y_params, x).squeeze()
         return ravel_pytree(jax.grad(fct_y)(y_params, x))[0]
@@ -222,7 +222,7 @@ def assemble_H(y_params, X):
 
 
 @jax.jit
-def assemble_J_bar(p_params, X):
+def assemble_J_p(p_params, X):
     def f_grad_lap_p(p_params, x):
         lap_p = lambda p_params, x: laplace(p_model, argnum=1)(p_params, x).squeeze()
         return ravel_pytree(jax.grad(lap_p)(p_params, x))[0]
@@ -231,16 +231,15 @@ def assemble_J_bar(p_params, X):
 
 
 @jax.jit
-def assemble_H_bar(p_params, X):
+def assemble_M_p(p_params, X):
     def f_fct_p(p_params, x):
         fct_p = lambda p_params, x: p_model(p_params, x).squeeze()
         return ravel_pytree(jax.grad(fct_p)(p_params, x))[0]
 
     # P = projection_prime(-1. / alpha * jax.vmap(p_model, (None, 0))(p_params, X))
     P = (
-        -1.0
-        / alpha
-        * projection_prime(-1.0 / alpha * jax.vmap(p_model, (None, 0))(p_params, X))
+        #-1.0 / alpha * 
+        projection_prime(-1.0 / alpha * jax.vmap(p_model, (None, 0))(p_params, X))
     )
 
     return P * jax.vmap(f_fct_p, (None, 0))(p_params, X)
@@ -248,17 +247,15 @@ def assemble_H_bar(p_params, X):
 
 @jax.jit
 def assemble_gramian(y_params, p_params, X):
-    J = assemble_J(y_params, X)
-    H = assemble_H(y_params, X)
-    A = 1.0 / len(X) * (J.T @ J + H.T @ H)
-
-    J_bar = assemble_J_bar(p_params, X)
-    H_bar = assemble_H_bar(p_params, X)
-    C = 1.0 / len(X) * (J_bar.T @ J_bar + H_bar.T @ H_bar)
-
-    B = 1.0 / (len(X)) * J.T @ H_bar + 1.0 / len(X) * H.T @ J_bar
-
-    # concat code from ChatGPT
+    J_y = assemble_J_y(y_params, X)
+    M_y = assemble_M_y(y_params, X)
+    J_p = assemble_J_p(p_params, X)
+    M_p = assemble_M_p(p_params, X)
+    
+    A = 1.0 / len(X) * (J_y.T @ J_y + M_y.T @ M_y)
+    B = 1.0 / len(X) * ((-1.0 / alpha) * J_y.T @ M_p + M_y.T @ J_p)
+    C = 1.0 / len(X) * (J_p.T @ J_p + (1.0 / alpha ** 2) * M_p.T @ M_p)
+    
     top = jnp.concatenate([A, B], axis=1)
     bottom = jnp.concatenate([B.T, C], axis=1)
 
@@ -307,7 +304,7 @@ for iteration in range(100000):
 
         # build and regularize the Gramian
         G = assemble_gramian(y_params, p_params, x_Omega)
-        G += 1e-5 * jnp.identity(len(G))
+        G += min(0.01 * loss, 1e-5) * jnp.identity(len(G))
 
         # compute natural gradient
         f_nat_grad = lstsq(G, f_grads, rcond=-1)[0]

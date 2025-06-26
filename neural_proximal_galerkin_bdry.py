@@ -23,7 +23,7 @@ parser.add_argument(
 parser.add_argument(
     "--method",
     help="The optimizer",
-    default="GN",
+    default="GD",
     type=str,
 )
 parser.add_argument(
@@ -239,7 +239,7 @@ while cauchy_err > 1e-06 and outer_iter < 20:
             )
 
             # param update
-            lr = 1e-2
+            lr = 1e-3
             params = jax.tree.map(lambda K, dK: K - lr * dK, params, grads)
 
             u_params, psi_params = params
@@ -286,7 +286,7 @@ while cauchy_err > 1e-06 and outer_iter < 20:
 
     plt.contourf(xx, yy, U, levels=100, cmap="viridis")
     plt.colorbar(label="u(x)")
-    plt.show()
+    #plt.show()
     # update outer params
     cauchy_err = l2_error_cauchy(u_params, u_prev_params, x_Omega)
     u_prev_params, psi_prev_params = params
