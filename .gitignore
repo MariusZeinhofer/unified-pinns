@@ -1,5 +1,6 @@
-# exclude medical data
+# exclude medical data and produced data
 data/
+out/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

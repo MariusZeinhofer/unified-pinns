@@ -5,6 +5,8 @@ import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.numpy.linalg import lstsq
+from matplotlib import pyplot as plt
+from pathlib import Path
 
 import natgrad.mlp as mlp
 from natgrad.domains import Hyperrectangle
@@ -58,21 +60,24 @@ seed = args.seed
 N_Omega = args.N_Omega
 N_Gamma = args.N_Gamma
 
+
 print(
     f"OPTIMAL CONTROL with ITER={ITER}, LM={LM}, N_Omega={N_Omega}, N_Gamma={N_Gamma}, "
-    f"SEED={seed}."
+    f"SEED={seed}, METHOD={method}."
 )
 
 # Initialize training components
 key = jax.random.PRNGKey(seed)
 sampler_key, eval_key, y_key, p_key, key = jax.random.split(key, num=5)
 
+
 # distance function to boundary
 dist_fct = lambda x: x[0] * (1 - x[0]) * x[1] * (1 - x[1])
 
+
 # model for state y
 y_activation = lambda x: jnp.tanh(x)
-y_layer_sizes = [2, 16, 1]
+y_layer_sizes = [2, 32, 1]
 y_params = mlp.init_params(y_layer_sizes, y_key)
 _y_model = mlp.mlp(y_activation)
 y_model = lambda params, x: _y_model(params, x) * dist_fct(x)
@@ -80,13 +85,13 @@ f_y_params, y_unravel = ravel_pytree(y_params)
 
 # model for control p
 p_activation = lambda x: jnp.tanh(x)
-p_layer_sizes = [2, 8, 1]
+p_layer_sizes = [2, 32, 1]
 p_params = mlp.init_params(p_layer_sizes, p_key)
 _p_model = mlp.mlp(p_activation)
 p_model = lambda params, x: _p_model(params, x) * dist_fct(x)
 f_p_params, p_unravel = ravel_pytree(p_params)
 
-# put params together, unclear if needed...
+# put params together
 params = (y_params, p_params)
 f_params, unravel = ravel_pytree(params)
 
@@ -97,19 +102,35 @@ interior = Hyperrectangle(intervals)
 x_Omega = interior.random_integration_points(sampler_key, N=N_Omega)
 x_eval = interior.random_integration_points(eval_key, N=10 * N_Omega)
 
+
+# the pointwise projection, acts on arrays of arbitrary shape
+lower_bound = -0.5
+upper_bound = 0.5
+def projection(x, lower=lower_bound, upper=upper_bound):
+    return jnp.minimum(jnp.maximum(x, lower), upper)
+
+
+def projection_prime(x, lower=lower_bound, upper=upper_bound):
+    return jnp.where((x > lower) & (x < upper), 1.0, 0.0)
+
+
 # PDE data and manufactured solutions
-alpha = 0.1
-y_star = lambda x: jnp.prod(jnp.sin(jnp.pi * x), keepdims=True)
-p_star = lambda x: x[0] * (1 - x[0]) * x[1] * (1 - x[1])
-u_star = lambda x: -(1.0 / alpha) * p_star(x)
-f = lambda x: dim * jnp.pi**2 * jnp.prod(jnp.sin(jnp.pi * x)) - u_star(x)
-y_data = lambda x: -2 * (x[0] * (1 - x[0]) + x[1] * (1 - x[1])) + y_star(x)
+alpha = 1e-5
+k = 2
+y_star = lambda x: jnp.prod(jnp.sin(k * jnp.pi * x), keepdims=True)
+lap_y_star = lambda x: -2 * (jnp.pi * k) ** 2 *  y_star(x)
+p_star = lambda x: 1.0 * jnp.prod(jnp.sin(k * jnp.pi * x), keepdims=True)
+lap_p_star = lambda x: -2 * (jnp.pi * k) ** 2 *  p_star(x)
+
+u_star = lambda x: projection(-(1.0 / alpha) * p_star(x))
+f = lambda x: - lap_y_star(x) - u_star(x)
+y_data = lambda x: y_star(x) + lap_p_star(x)
 
 
 # define ingredients for loss functions
 def residual_y(y_params, p_params, x):
     lap_y = laplace(y_model, argnum=1)(y_params, x)
-    return lap_y + f(x) - (1.0 / alpha) * p_model(p_params, x)
+    return lap_y + f(x) + projection(-(1.0 / alpha) * p_model(p_params, x))
 
 
 v_residual_y = jax.vmap(residual_y, (None, None, 0))
@@ -132,7 +153,7 @@ def loss_fct(y_params, p_params, X):
 
 # Gauss-Newton matrix builders
 @jax.jit
-def assemble_J(y_params, X):
+def assemble_J_y(y_params, X):
     def f_grad_lap_y(y_params, x):
         lap_y = lambda y_params, x: laplace(y_model, argnum=1)(y_params, x).squeeze()
         return ravel_pytree(jax.grad(lap_y)(y_params, x))[0]
@@ -141,7 +162,7 @@ def assemble_J(y_params, X):
 
 
 @jax.jit
-def assemble_H(y_params, X):
+def assemble_M_y(y_params, X):
     def f_fct_y(y_params, x):
         fct_y = lambda y_params, x: y_model(y_params, x).squeeze()
         return ravel_pytree(jax.grad(fct_y)(y_params, x))[0]
@@ -150,7 +171,7 @@ def assemble_H(y_params, X):
 
 
 @jax.jit
-def assemble_J_bar(p_params, X):
+def assemble_J_p(p_params, X):
     def f_grad_lap_p(p_params, x):
         lap_p = lambda p_params, x: laplace(p_model, argnum=1)(p_params, x).squeeze()
         return ravel_pytree(jax.grad(lap_p)(p_params, x))[0]
@@ -159,27 +180,31 @@ def assemble_J_bar(p_params, X):
 
 
 @jax.jit
-def assemble_H_bar(p_params, X):
+def assemble_M_p(p_params, X):
     def f_fct_p(p_params, x):
         fct_p = lambda p_params, x: p_model(p_params, x).squeeze()
         return ravel_pytree(jax.grad(fct_p)(p_params, x))[0]
 
-    return jax.vmap(f_fct_p, (None, 0))(p_params, X)
+    # P = projection_prime(-1. / alpha * jax.vmap(p_model, (None, 0))(p_params, X))
+    P = (
+        #-1.0 / alpha * 
+        projection_prime(-1.0 / alpha * jax.vmap(p_model, (None, 0))(p_params, X))
+    )
+
+    return P * jax.vmap(f_fct_p, (None, 0))(p_params, X)
 
 
 @jax.jit
 def assemble_gramian(y_params, p_params, X):
-    J = assemble_J(y_params, X)
-    H = assemble_H(y_params, X)
-    A = 1.0 / len(X) * (J.T @ J + H.T @ H)
-
-    J_bar = assemble_J_bar(p_params, X)
-    H_bar = assemble_H_bar(p_params, X)
-    C = 1.0 / len(X) * (J_bar.T @ J_bar + 1.0 / (alpha**2) * H_bar.T @ H_bar)
-
-    B = 1.0 / (len(X) * alpha) * J.T @ H_bar + 1.0 / len(X) * H.T @ J_bar
-
-    # concat code from ChatGPT
+    J_y = assemble_J_y(y_params, X)
+    M_y = assemble_M_y(y_params, X)
+    J_p = assemble_J_p(p_params, X)
+    M_p = assemble_M_p(p_params, X)
+    
+    A = 1.0 / len(X) * (J_y.T @ J_y + M_y.T @ M_y)
+    B = 1.0 / len(X) * ((-1.0 / alpha) * J_y.T @ M_p + M_y.T @ J_p)
+    C = 1.0 / len(X) * (J_p.T @ J_p + (1.0 / alpha ** 2) * M_p.T @ M_p)
+    
     top = jnp.concatenate([A, B], axis=1)
     bottom = jnp.concatenate([B.T, C], axis=1)
 
@@ -199,9 +224,10 @@ def l2_error_p(p_params, X):
     )
 
 
-lr = 1e-3
+lr = 1e-2
 
-for iteration in range(100_000):
+iterations=2000
+for iteration in range(iterations):
     if method == "GD":
         # autodiff magic
         loss, grads = jax.value_and_grad(loss_fct, argnums=(0, 1))(
@@ -228,14 +254,13 @@ for iteration in range(100_000):
 
         # build and regularize the Gramian
         G = assemble_gramian(y_params, p_params, x_Omega)
-        G += 1e-6 * jnp.identity(len(G))
+        G += min(0.01 * loss, 1e-5) * jnp.identity(len(G))
 
         # compute natural gradient
         f_nat_grad = lstsq(G, f_grads, rcond=-1)[0]
         nat_grads = unravel(f_nat_grad)
 
         # param update
-        lr = 1e-2
         params = jax.tree.map(lambda K, dK: K - lr * dK, params, nat_grads)
         y_params, p_params = params
 
@@ -245,23 +270,31 @@ for iteration in range(100_000):
                 f"p_error {l2_error_p(p_params, x_eval)}"
             )
 
+# 1. build a regular (α,β) grid in [-1,1]×[-1,1]
+n = 200
+line = jnp.linspace(0, 1, n)
+X, Y = jnp.meshgrid(line, line, indexing='xy')  # shape = (n, n)
+points = jnp.stack([X.flatten(), Y.flatten()], axis=1)
+U_star = jax.vmap(u_star)(points).reshape(X.shape)
+U = jax.vmap(lambda x: projection(-(1.0 / alpha) * p_model(p_params, x)))(points).reshape(X.shape)
 
-if __name__ == "__main__":
-    x = jnp.array([1.0, 0.0])
-    X = jnp.array([[1.0, 0.0], [1.0, 0.5]])
 
-    print(
-        f"y_model(y_params, x)={y_model(y_params, x)}",
-        "shape",
-        y_model(y_params, x).shape,
-    )  # of shape (1,)
-    print(f"y_star(x)={y_star(x)}", "shape", y_star(x).shape)  # of shape (1,)
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    print(
-        f"lap_y shape: {laplace(y_model, argnum=1)(y_params, x).shape}"
-    )  # of shape (1,)
-    print(
-        f"shape residual_y output {v_residual_y(y_params, p_params, X).shape}"
-    )  # of shape (2, 1)
+# First plot: F
+pcm1 = ax1.pcolormesh(X, Y, U, shading='auto', cmap='viridis')
+fig.colorbar(pcm1, ax=ax1, label='u')
+ax1.set_title(f'Learned control, alpha = {alpha}')
+ax1.set_xlabel('x_0')
+ax1.set_ylabel('x_1')
 
-    print(f"loss_fct value {loss_fct(y_params, p_params, x_Omega)}")  # of shape ()
+# Second plot: F_prime
+pcm2 = ax2.pcolormesh(X, Y, jnp.abs(U - U_star), shading='auto', cmap='viridis')
+fig.colorbar(pcm2, ax=ax2, label='u')
+ax2.set_title(f'Control error, alpha = {alpha}')
+ax2.set_xlabel('x_0')
+ax2.set_ylabel('x_1')
+
+
+plt.tight_layout()
+plt.savefig(Path("out") / f"controls-k-{k}-alpha-{alpha}-iter-{iterations}.png" )
